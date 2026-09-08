@@ -1,0 +1,105 @@
+# Keycloak, providing the OAuth2 backend for the "auth" section of config.yaml.
+#
+# Two things to know before using this beyond a scratch cluster:
+#
+#   * The image is Keycloak 22 built with --optimized against the embedded H2
+#     database, and is started with --import-realm. There is no persistent
+#     volume here because H2 lives in the container filesystem: every restart
+#     re-imports veraison-realm.json and discards anything created at runtime.
+#     Point Keycloak at a real database before you rely on it.
+#
+#   * The admin credentials below are the admin/admin defaults carried over from
+#     the docker deployment. Replace this Secret (or drop it and reference your
+#     own) before exposing the service to anything.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-admin
+  namespace: veraison
+type: Opaque
+stringData:
+  username: admin
+  password: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: veraison
+  labels:
+    app.kubernetes.io/name: keycloak
+    app.kubernetes.io/part-of: veraison
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keycloak
+        app.kubernetes.io/part-of: veraison
+    spec:
+      containers:
+        - name: keycloak
+          image: veraison/keycloak:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - start
+            - --optimized
+            - --import-realm
+            - --verbose
+            - --https-certificate-file
+            - /opt/keycloak/keycloak.crt
+            - --https-certificate-key-file
+            - /opt/keycloak/keycloak.key
+          env:
+            - name: KEYCLOAK_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: username
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin
+                  key: password
+          ports:
+            - name: https
+              containerPort: 11111
+          # The image is built with kc.sh build without the health feature, so
+          # there is no /health endpoint to probe; TCP is what we have.
+          readinessProbe:
+            tcpSocket:
+              port: 11111
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: 11111
+            initialDelaySeconds: 90
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1536Mi
+---
+# As with vts-service, the name matters: keycloak.crt carries DNS:keycloak-service,
+# and auth.host in config.yaml resolves it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-service
+  namespace: veraison
+spec:
+  selector:
+    app.kubernetes.io/name: keycloak
+  ports:
+    - name: https
+      port: 11111
+      targetPort: 11111

@@ -1,0 +1,110 @@
+# Veraison service configuration, rendered for Kubernetes.
+#
+# This is the docker deployment's src/config.yaml.template with the ports
+# substituted, and two deliberate changes for Kubernetes:
+#
+#   * logging.output-paths is stdout only. The docker deployment also writes to
+#     logs/<service>-stdout.log on a shared "veraison-logs" volume; in a cluster
+#     you want the container log stream instead, and dropping the file path
+#     removes the need for a writable logs volume in every pod.
+#
+#   * vts.server-addr and auth.host resolve to the Services in this namespace.
+#     The names are unchanged from the docker deployment on purpose: the service
+#     certificates in deployments/docker/src/certs carry SANs for exactly these
+#     short names (DNS:vts-service, DNS:keycloak-service), so in-cluster TLS
+#     verifies only if the Services keep these names.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: veraison-config
+  namespace: veraison
+data:
+  config.yaml: |
+    logging:
+      level: info  # valid levels: error, warning, info, debug
+      output-paths:
+        - stdout
+    provisioning:
+      listen-addr: 0.0.0.0:9443
+      protocol: https
+      cert: /opt/veraison/provisioning.crt
+      cert-key: /opt/veraison/provisioning.key
+    verification:
+      listen-addr: 0.0.0.0:8443
+      protocol: https
+      cert: /opt/veraison/verification.crt
+      cert-key: /opt/veraison/verification.key
+    management:
+      listen-addr: 0.0.0.0:10443
+      protocol: https
+      cert: /opt/veraison/management.crt
+      cert-key: /opt/veraison/management.key
+    coserv:
+      listen-addr: 0.0.0.0:11443
+      protocol: https
+      cert: /opt/veraison/coserv.crt
+      cert-key: /opt/veraison/coserv.key
+      max-expiry: 5 mins
+      signer:
+        alg: ES256
+        key: /opt/veraison/coserv-signer.jwk
+    vts:
+      server-addr: vts-service:50051
+      tls: true
+      cert: /opt/veraison/vts.crt
+      cert-key: /opt/veraison/vts.key
+      ca-certs:
+        - /usr/local/share/ca-certificates/corim-ca.crt
+    ear-signer:
+      alg: ES256
+      key: skey.jwk
+    plugin:
+      backend: go-plugin
+      go-plugin:
+        dir: ./plugins/
+    store:
+      dbms: sqlite
+      dsn: stores/vts/store.sql
+    po-store:
+      backend: sql
+      sql:
+        max_connections: 10
+        driver: sqlite3
+        datasource: stores/vts/po-store.sql
+    po-agent:
+        backend: opa
+    auth:
+      backend: keycloak
+      host: keycloak-service
+      port: 11111
+    # NVIDIA GPU attestation stays off unless you add a "scheme" section below.
+    # Without one, vts logs this and then carries on without the plugin, so GPU
+    # evidence is rejected as an unsupported media type:
+    #
+    #   ERROR plugin q: nvidia-scheme-plugin ... service token is required
+    #
+    # scheme/nvidia defaults to verifier_mode "remote". Uncomment one of:
+    #
+    # scheme:
+    #   nvidia:
+    #     verifier_mode: remote     # appraisal happens at NVIDIA (NRAS)
+    #     service_token: <API token>
+    #
+    # scheme:
+    #   nvidia:
+    #     verifier_mode: local      # appraisal happens in-process, inside libnvat
+    #
+    # "local" does not mean offline. It still creates a *remote* RIM store and a
+    # remote OCSP client, so both modes need network egress to NVIDIA -- Veraison
+    # binds no offline RIM store constructor at all. Set "remote_host" to point
+    # both at a mirror.
+    #
+    # Veraison only *enforces* the token for "remote", but it passes the token to
+    # the RIM store and OCSP client in "local" mode too. Whether an empty token
+    # is accepted there is up to libnvat, so treat local-without-token as
+    # untested rather than supported.
+    #
+    # A token does not belong in a ConfigMap. For remote mode, move this whole
+    # file into a Secret and point the "config" volume at it: config.ReadRawConfig
+    # calls AutomaticEnv without a key replacer, so nested settings like this one
+    # cannot be supplied through an environment variable.

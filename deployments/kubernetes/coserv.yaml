@@ -1,0 +1,66 @@
+# CoSERV service: serves Concise Selector for Endorsements and Reference Values
+# queries. Stateless, backed by VTS over gRPC.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coserv
+  namespace: veraison
+  labels:
+    app.kubernetes.io/name: coserv
+    app.kubernetes.io/part-of: veraison
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: coserv
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: coserv
+        app.kubernetes.io/part-of: veraison
+    spec:
+      containers:
+        - name: coserv
+          image: veraison/coserv:latest
+          imagePullPolicy: IfNotPresent
+          args: ["/opt/veraison/coserv-service"]
+          ports:
+            - name: https
+              containerPort: 11443
+          volumeMounts:
+            - name: config
+              mountPath: /opt/veraison/config.yaml
+              subPath: config.yaml
+          readinessProbe:
+            tcpSocket:
+              port: 11443
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 11443
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: veraison-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coserv-service
+  namespace: veraison
+spec:
+  selector:
+    app.kubernetes.io/name: coserv
+  ports:
+    - name: https
+      port: 11443
+      targetPort: 11443

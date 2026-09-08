@@ -1,0 +1,171 @@
+# VTS (Veraison Trusted Services) and the management service.
+#
+# These two run as containers in a single Pod on purpose. Both open the same
+# SQLite files directly -- vts uses stores/vts/store.sql and stores/vts/po-store.sql,
+# and management/policy.go opens the same po-store to manage policies. SQLite's
+# locking is only safe for processes on one machine sharing one filesystem, so
+# the two must be co-scheduled and share a volume. That is exactly what the
+# docker deployment does with the "veraison-stores" volume; a Pod is the
+# equivalent unit here.
+#
+# For the same reason this is a single replica with a Recreate strategy: a
+# rolling update would briefly run two pods against one RWO volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: veraison-stores
+  namespace: veraison
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vts
+  namespace: veraison
+  labels:
+    app.kubernetes.io/name: vts
+    app.kubernetes.io/part-of: veraison
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vts
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vts
+        app.kubernetes.io/part-of: veraison
+    spec:
+      securityContext:
+        # The service images create group "veraison" with GID 616 and deploy the
+        # stores group-writable (dirs 0775, files 0660). fsGroup 616 makes the
+        # mounted volume writable by both containers under that same group.
+        fsGroup: 616
+      initContainers:
+        # A named docker volume inherits whatever the image has at the mount
+        # point the first time it is used; a Kubernetes volume does not -- it
+        # mounts empty and hides the seeded databases baked into the image at
+        # /opt/veraison/stores/vts. Without this step vts starts against an
+        # empty directory and fails to open its stores. Mounting the claim
+        # somewhere else here keeps the image's copy visible so we can seed it.
+        - name: seed-stores
+          image: veraison/vts:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              mkdir -p /mnt/stores/vts
+              for src in /opt/veraison/stores/vts/*; do
+                  [ -e "$src" ] || continue
+                  dst="/mnt/stores/vts/$(basename "$src")"
+                  if [ -e "$dst" ]; then
+                      echo "keeping existing $dst"
+                  else
+                      echo "seeding $dst"
+                      cp -a "$src" "$dst"
+                  fi
+              done
+          volumeMounts:
+            - name: stores
+              mountPath: /mnt/stores
+      containers:
+        - name: vts
+          image: veraison/vts:latest
+          imagePullPolicy: IfNotPresent
+          args: ["/opt/veraison/vts-service"]
+          ports:
+            - name: grpc
+              containerPort: 50051
+          volumeMounts:
+            - name: stores
+              mountPath: /opt/veraison/stores
+            - name: config
+              mountPath: /opt/veraison/config.yaml
+              subPath: config.yaml
+          # gRPC over TLS with a private CA; a TCP probe avoids having to teach
+          # the kubelet to trust the Veraison root certificate.
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+        - name: management
+          image: veraison/management:latest
+          imagePullPolicy: IfNotPresent
+          args: ["/opt/veraison/management-service"]
+          ports:
+            - name: https
+              containerPort: 10443
+          volumeMounts:
+            - name: stores
+              mountPath: /opt/veraison/stores
+            - name: config
+              mountPath: /opt/veraison/config.yaml
+              subPath: config.yaml
+          readinessProbe:
+            tcpSocket:
+              port: 10443
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: stores
+          persistentVolumeClaim:
+            claimName: veraison-stores
+        - name: config
+          configMap:
+            name: veraison-config
+---
+# The name "vts-service" is required, not cosmetic: the baked-in vts.crt has
+# SANs DNS:vts-service and DNS:vts-service.veraison-net, and every client
+# resolves it from vts.server-addr in the config.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vts-service
+  namespace: veraison
+spec:
+  selector:
+    app.kubernetes.io/name: vts
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: management-service
+  namespace: veraison
+spec:
+  selector:
+    app.kubernetes.io/name: vts
+  ports:
+    - name: https
+      port: 10443
+      targetPort: 10443
