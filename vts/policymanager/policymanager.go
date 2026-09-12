@@ -42,8 +42,24 @@ func (o *PolicyManager) Evaluate(
 
 	pol, err := o.getPolicy(policyKey)
 	if err != nil {
-		if errors.Is(err, policy.ErrNoPolicy) {
-			o.logger.Debugw("no policy", "policy-id", policyKey)
+		// ErrNoActivePolicy is as benign here as ErrNoPolicy. Deactivating a
+		// policy is a documented, first-class operation -- the management API
+		// offers it and returns 200 -- and it leaves the store holding
+		// policies with none active. Treating that as fatal made every
+		// subsequent appraisal for the scheme fail with
+		//
+		//   ERROR vts no active policy for key "0:PSA_IOT:opa"
+		//
+		// and the verifier answer 500 for all evidence of that scheme: not a
+		// degraded verdict but no verdict at all, and unrecoverable except by
+		// activating a policy again. Appraisal without a policy is exactly
+		// what happens before one is ever created, so "none active" should
+		// behave the same way.
+		//
+		// respondToGet in management/api/handler.go already treats the two
+		// alike; this is the appraisal path catching up.
+		if errors.Is(err, policy.ErrNoPolicy) || errors.Is(err, policy.ErrNoActivePolicy) {
+			o.logger.Debugw("no active policy", "policy-id", policyKey)
 			return nil // No policy? No problem!
 		}
 
