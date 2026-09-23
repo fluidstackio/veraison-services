@@ -219,7 +219,8 @@ func (o *Implementation) ValidateEvidenceIntegrity(
 	o.logger.Debugw("SPDM measurements verified",
 		"target", b.TargetID, "spdm", res.Version.String(), "algorithm", res.Algorithm,
 		"blocks", res.Blocks, "request-in-payload", res.RequestPrepended,
-		"prior-exchanges", res.PriorExchanges, "digest-corrected", res.DigestCorrected)
+		"prior-exchanges", res.PriorExchanges, "digest-corrected", res.DigestCorrected,
+		"signature-little-endian", res.SignatureLittleEndian)
 	return nil
 }
 

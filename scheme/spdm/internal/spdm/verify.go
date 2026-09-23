@@ -123,6 +123,9 @@ type Result struct {
 	// responder's advertised algorithms cannot be taken at face value, which is
 	// worth surfacing rather than silently absorbing.
 	DigestCorrected bool
+	// SignatureLittleEndian is true when r and s verified only as little-endian
+	// integers. Accepted for SPDM 1.0 responders alone; see signatureEncodings.
+	SignatureLittleEndian bool
 	// NonceBinding says whether the verifier's nonce reached the transcript.
 	NonceBinding NonceBinding
 	// NonceMatched is true only for NonceBindingVerifier.
@@ -240,18 +243,22 @@ func Verify(in Input) (Result, error) {
 		transcripts = append(transcripts, spanning)
 	}
 
-	for _, cand := range append([]Algorithm{alg}, alternateDigests(alg)...) {
-		for i, candidate := range transcripts {
-			if !verifyECDSA(pub, cand, candidate, m.Signature) {
-				continue
+	for _, enc := range signatureEncodings(m.Version) {
+		sig := enc.decode(m.Signature)
+		for _, cand := range append([]Algorithm{alg}, alternateDigests(alg)...) {
+			for i, candidate := range transcripts {
+				if !verifyECDSA(pub, cand, candidate, sig) {
+					continue
+				}
+				res.Algorithm = cand.Name
+				res.DigestCorrected = cand.Hash != alg.Hash
+				res.SignatureLittleEndian = enc.littleEndian
+				if i > 0 {
+					res.PriorExchanges++
+				}
+				res.Outcome = OutcomeVerified
+				return res, nil
 			}
-			res.Algorithm = cand.Name
-			res.DigestCorrected = cand.Hash != alg.Hash
-			if i > 0 {
-				res.PriorExchanges++
-			}
-			res.Outcome = OutcomeVerified
-			return res, nil
 		}
 	}
 
@@ -297,6 +304,44 @@ func verifyChain(chain [][]byte, anchors *x509.CertPool, now time.Time) (*x509.C
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	})
 	return leaf, err
+}
+
+type signatureEncoding struct {
+	littleEndian bool
+	decode       func([]byte) []byte
+}
+
+// signatureEncodings lists the byte orders an ECDSA r||s signature is tried in.
+//
+// DSP0274 1.0 defines the ECDSA signature as r followed by s without fixing
+// their byte order; 1.2 settled on big-endian, which is what 1.1 and later
+// responders use. The Intel Xeon GNR S3M answers at 1.0 with each half
+// little-endian: its signature verifies over exactly the transcript it
+// returns, under its own leaf key and hash, only in that order (every other
+// key, transcript, digest and order was tried; established 2026-09-23 on
+// wdl101-b300-mach1 CPU.Socket.0).
+//
+// The fallback is confined to 1.0, where the order was genuinely ambiguous. It
+// does not weaken anything: either order still needs a signature the device's
+// key produced over our transcript. A later responder signing little-endian is
+// non-conformant and fails, rather than being absorbed here.
+func signatureEncodings(v Version) []signatureEncoding {
+	encs := []signatureEncoding{{decode: func(sig []byte) []byte { return sig }}}
+	if v == V10 {
+		encs = append(encs, signatureEncoding{littleEndian: true, decode: reverseHalves})
+	}
+	return encs
+}
+
+// reverseHalves turns little-endian r||s into big-endian r||s.
+func reverseHalves(sig []byte) []byte {
+	out := make([]byte, len(sig))
+	half := len(sig) / 2
+	for i := 0; i < half; i++ {
+		out[half-1-i] = sig[i]
+		out[len(sig)-1-i] = sig[half+i]
+	}
+	return out
 }
 
 // diceExtensions are the TCG DICE certificate extensions this verifier accounts

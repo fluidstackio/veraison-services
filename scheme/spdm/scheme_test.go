@@ -234,8 +234,7 @@ func TestDecodeBundle_RejectsIncompleteAndUnknownSchema(t *testing.T) {
 }
 
 // Collected 2026-09-23 from wdl101-b300-mach1 through its iDRAC, one target per
-// component class. The Intel CPU is kept out of this table; see
-// TestIntelCPU_ChainVerifiesSignatureDoesNot.
+// component class.
 var hardwareCorpus = []struct {
 	fixture string
 	root    string
@@ -246,6 +245,10 @@ var hardwareCorpus = []struct {
 	{"mach1-connectx0.json", nvidiaRoot, "HGX_IRoT_ConnectX_0", "1.1"},
 	{"mach1-erot-nvswitch0.json", nvidiaRoot, "HGX_ERoT_NVSwitch_0", "1.1"},
 	{"mach1-nic-slot6.json", nvidiaRoot, "NIC.Slot.6", "1.1"},
+	// Intel Xeon GNR S3M, SPDM 1.0, little-endian r||s. Its chain ends at
+	// Intel's DICE root, which has no O and whose PEM is taken from this chain
+	// (trust on first use, for tests only).
+	{"mach1-cpu-socket0.json", "intel-dice-root-ca.pem", "CPU.Socket.0", "1.0"},
 }
 
 func anchorFromFile(t *testing.T, name string) []*comid.KeyTriple {
@@ -305,22 +308,49 @@ func TestGetTrustAnchorIDs_RootWithoutOrganization(t *testing.T) {
 	assert.Equal(t, "Intel DICE Root CA", *ids[0].Class.Model)
 }
 
-// CPU.Socket.0 (Intel Xeon GNR S3M, SPDM 1.0). Its chain ends at Intel's DICE
-// root, which has no O and whose PEM is taken from this chain (trust on first
-// use, for tests only). With the TCG DICE extensions accepted the chain now
-// verifies, but the signature does not verify over the transcript the payload
-// carries. The payload parses exactly, and the algorithms match the leaf key.
-//
-// The likeliest cause is DSP0274 1.0 itself: L1/L2 covers every GET_MEASUREMENTS
-// exchange in the context, not only the signed one, so if the BMC queried the
-// CPU before the signed request -- a block count, say -- those exchanges are in
-// the signed transcript and absent from the payload. Unconfirmed.
-//
-// This pins the current state so the day it is fixed, this test fails loudly
-// and the CPU moves into hardwareCorpus.
-func TestIntelCPU_ChainVerifiesSignatureDoesNot(t *testing.T) {
-	b := loadBundle(t, "mach1-cpu-socket0.json")
-	err := NewImplementation().ValidateEvidenceIntegrity(
-		evidenceFor(t, b, b.Nonce), anchorFromFile(t, "intel-dice-root-ca.pem"), nil)
-	requireBadEvidence(t, err, "signature does not verify over the reconstructed L1/L2 transcript")
+// reverseSignatureHalves byte-swaps r and s in place of the signature at the
+// end of the payload, converting between big- and little-endian halves.
+func reverseSignatureHalves(t *testing.T, b *Bundle) {
+	t.Helper()
+	const sigLen = 96 // ECDSA P-384 r||s, what every fixture here uses
+	sig := b.SignedMeasurements[len(b.SignedMeasurements)-sigLen:]
+	for _, half := range [][]byte{sig[:sigLen/2], sig[sigLen/2:]} {
+		for i, j := 0, len(half)-1; i < j; i, j = i+1, j-1 {
+			half[i], half[j] = half[j], half[i]
+		}
+	}
+}
+
+func TestSignatureByteOrder_LittleEndianOnlyForSPDM10(t *testing.T) {
+	// A 1.1 responder's signature byte-swapped is the same signature a
+	// non-conformant little-endian 1.1 responder would send. It must fail:
+	// the fallback exists for 1.0's ambiguity, not as general tolerance.
+	gpu := loadBundle(t, fixtureBound)
+	reverseSignatureHalves(t, gpu)
+	requireBadEvidence(t, NewImplementation().ValidateEvidenceIntegrity(
+		evidenceFor(t, gpu, gpu.Nonce), nvidiaTrustAnchor(t), nil), "not verified")
+}
+
+func TestSignatureByteOrder_BigEndianStillAcceptedForSPDM10(t *testing.T) {
+	// The Intel CPU's signature converted to big-endian: the order DSP0274
+	// later settled on is never refused, only the little-endian one is extra.
+	cpu := loadBundle(t, "mach1-cpu-socket0.json")
+	reverseSignatureHalves(t, cpu)
+	require.NoError(t, NewImplementation().ValidateEvidenceIntegrity(
+		evidenceFor(t, cpu, cpu.Nonce), anchorFromFile(t, "intel-dice-root-ca.pem"), nil))
+}
+
+// mach2's CPU.Socket.0 from 2026-09-23 verifies under no key in its chain,
+// over neither transcript, under no digest or byte order, while the same
+// socket verified in two earlier sweeps with the same chain. SPDM 1.0's L1/L2
+// covers every GET_MEASUREMENTS exchange in the responder's context since its
+// last signed one, so an exchange by another requester in between would be
+// signed over and absent from the payload; it was collected a minute after
+// another session's fsattest activity. Unconfirmed. Either way it must be
+// rejected: a concurrent requester can deny SPDM 1.0 evidence, never forge it.
+func TestIntelCPU_UnverifiableTranscriptIsRejected(t *testing.T) {
+	b := loadBundle(t, "mach2-cpu-socket0-unverifiable.json")
+	requireBadEvidence(t, NewImplementation().ValidateEvidenceIntegrity(
+		evidenceFor(t, b, b.Nonce), anchorFromFile(t, "intel-dice-root-ca.pem"), nil),
+		"signature does not verify")
 }
