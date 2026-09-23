@@ -10,6 +10,7 @@ SUBDIR += parsec-tpm
 SUBDIR += psa-iot
 SUBDIR += riot
 SUBDIR += sevsnp
+SUBDIR += spdm
 SUBDIR += tpm-enacttrust
 
 SUBDIR += amd-kds-coserv

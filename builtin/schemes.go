@@ -14,6 +14,7 @@ import (
 	scheme6 "github.com/veraison/services/scheme/psa-iot"
 	scheme2 "github.com/veraison/services/scheme/riot"
 	scheme7 "github.com/veraison/services/scheme/sevsnp"
+	scheme10 "github.com/veraison/services/scheme/spdm"
 	scheme4 "github.com/veraison/services/scheme/tpm-enacttrust"
 )
 
@@ -25,6 +26,7 @@ var plugins = []plugin.IPluggable{
 	handler.MustNewSchemeImplementationWrapper(scheme5.Descriptor, scheme5.NewImplementation()),
 	handler.MustNewSchemeImplementationWrapper(scheme6.Descriptor, scheme6.NewImplementation()),
 	handler.MustNewSchemeImplementationWrapper(scheme7.Descriptor, scheme7.NewImplementation()),
+	handler.MustNewSchemeImplementationWrapper(scheme10.Descriptor, scheme10.NewImplementation()),
 	&scheme8.CoservProxyHandler{},
 	&scheme9.CoservProxyHandler{},
 }
