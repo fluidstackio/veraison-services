@@ -48,7 +48,7 @@ var Descriptor = handler.SchemeDescriptor{
 
 var (
 	ErrNoRoot       = errors.New("certificate chain has no self-signed root")
-	ErrRootIdentity = errors.New("root certificate has no organization to identify its vendor")
+	ErrRootIdentity = errors.New("root certificate has no common name to identify it by")
 	ErrSessionNonce = fmt.Errorf("session nonce must be %d bytes, the SPDM requester nonce size", wire.NonceSize)
 )
 
@@ -78,16 +78,26 @@ func (o *Implementation) GetTrustAnchorIDs(
 	if err != nil {
 		return nil, handler.BadEvidence(err)
 	}
-	if len(root.Subject.Organization) == 0 {
-		return nil, handler.BadEvidence(ErrRootIdentity)
+	class, err := rootClass(root)
+	if err != nil {
+		return nil, handler.BadEvidence(err)
 	}
+	return []*comid.Environment{{Class: class}}, nil
+}
 
-	return []*comid.Environment{{
-		Class: &comid.Class{
-			Vendor: &root.Subject.Organization[0],
-			Model:  &root.Subject.CommonName,
-		},
-	}}, nil
+// rootClass is the trust-anchor lookup key for a vendor root: model is its CN,
+// vendor its O when it has one. Not every root names an organization -- Intel's
+// DICE root is CN only -- and the key only chooses which provisioned root to
+// verify against, so a missing O narrows nothing that matters.
+func rootClass(root *x509.Certificate) (*comid.Class, error) {
+	if root.Subject.CommonName == "" {
+		return nil, ErrRootIdentity
+	}
+	class := &comid.Class{Model: &root.Subject.CommonName}
+	if len(root.Subject.Organization) > 0 {
+		class.Vendor = &root.Subject.Organization[0]
+	}
+	return class, nil
 }
 
 // ExtractClaims decodes the measurements without trusting them; integrity is

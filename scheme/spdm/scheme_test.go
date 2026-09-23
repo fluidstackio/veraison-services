@@ -232,3 +232,95 @@ func TestDecodeBundle_RejectsIncompleteAndUnknownSchema(t *testing.T) {
 	_, err = decodeBundle(encode(t, b))
 	assert.ErrorIs(t, err, ErrSchema)
 }
+
+// Collected 2026-09-23 from wdl101-b300-mach1 through its iDRAC, one target per
+// component class. The Intel CPU is kept out of this table; see
+// TestIntelCPU_ChainVerifiesSignatureDoesNot.
+var hardwareCorpus = []struct {
+	fixture string
+	root    string
+	target  string
+	spdm    string
+}{
+	{fixtureBound, nvidiaRoot, "HGX_IRoT_GPU_0", "1.1"},
+	{"mach1-connectx0.json", nvidiaRoot, "HGX_IRoT_ConnectX_0", "1.1"},
+	{"mach1-erot-nvswitch0.json", nvidiaRoot, "HGX_ERoT_NVSwitch_0", "1.1"},
+	{"mach1-nic-slot6.json", nvidiaRoot, "NIC.Slot.6", "1.1"},
+}
+
+func anchorFromFile(t *testing.T, name string) []*comid.KeyTriple {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", name))
+	require.NoError(t, err)
+	return trustAnchorFromPEM(t, string(raw))
+}
+
+func TestHardwareCorpus_VerifiesUnderItsOwnRoot(t *testing.T) {
+	for _, tc := range hardwareCorpus {
+		t.Run(tc.target, func(t *testing.T) {
+			b := loadBundle(t, tc.fixture)
+			impl := NewImplementation()
+
+			claims, err := impl.ExtractClaims(evidenceFor(t, b, b.Nonce), nil)
+			require.NoError(t, err)
+			assert.Equal(t, tc.target, claims["target-id"])
+			assert.Equal(t, tc.spdm, claims["spdm-version"])
+
+			require.NoError(t, impl.ValidateEvidenceIntegrity(
+				evidenceFor(t, b, b.Nonce), anchorFromFile(t, tc.root), nil))
+		})
+	}
+}
+
+func TestHardwareCorpus_ReplayToFreshSessionFails(t *testing.T) {
+	for _, tc := range hardwareCorpus {
+		t.Run(tc.target, func(t *testing.T) {
+			b := loadBundle(t, tc.fixture)
+			err := NewImplementation().ValidateEvidenceIntegrity(
+				evidenceFor(t, b, freshNonce(t)), anchorFromFile(t, tc.root), nil)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, handler.BadEvidenceError{})
+		})
+	}
+}
+
+func TestHardwareCorpus_WrongVendorRootFails(t *testing.T) {
+	// The Intel CPU chain against NVIDIA's root, and the reverse.
+	cpu := loadBundle(t, "mach1-cpu-socket0.json")
+	requireBadEvidence(t, NewImplementation().ValidateEvidenceIntegrity(
+		evidenceFor(t, cpu, cpu.Nonce), nvidiaTrustAnchor(t), nil), "trust anchor")
+
+	gpu := loadBundle(t, fixtureBound)
+	requireBadEvidence(t, NewImplementation().ValidateEvidenceIntegrity(
+		evidenceFor(t, gpu, gpu.Nonce), anchorFromFile(t, "intel-dice-root-ca.pem"), nil), "trust anchor")
+}
+
+func TestGetTrustAnchorIDs_RootWithoutOrganization(t *testing.T) {
+	b := loadBundle(t, "mach1-cpu-socket0.json")
+
+	ids, err := NewImplementation().GetTrustAnchorIDs(evidenceFor(t, b, b.Nonce))
+	require.NoError(t, err)
+	require.Len(t, ids, 1)
+	assert.Nil(t, ids[0].Class.Vendor)
+	assert.Equal(t, "Intel DICE Root CA", *ids[0].Class.Model)
+}
+
+// CPU.Socket.0 (Intel Xeon GNR S3M, SPDM 1.0). Its chain ends at Intel's DICE
+// root, which has no O and whose PEM is taken from this chain (trust on first
+// use, for tests only). With the TCG DICE extensions accepted the chain now
+// verifies, but the signature does not verify over the transcript the payload
+// carries. The payload parses exactly, and the algorithms match the leaf key.
+//
+// The likeliest cause is DSP0274 1.0 itself: L1/L2 covers every GET_MEASUREMENTS
+// exchange in the context, not only the signed one, so if the BMC queried the
+// CPU before the signed request -- a block count, say -- those exchanges are in
+// the signed transcript and absent from the payload. Unconfirmed.
+//
+// This pins the current state so the day it is fixed, this test fails loudly
+// and the CPU moves into hardwareCorpus.
+func TestIntelCPU_ChainVerifiesSignatureDoesNot(t *testing.T) {
+	b := loadBundle(t, "mach1-cpu-socket0.json")
+	err := NewImplementation().ValidateEvidenceIntegrity(
+		evidenceFor(t, b, b.Nonce), anchorFromFile(t, "intel-dice-root-ca.pem"), nil)
+	requireBadEvidence(t, err, "signature does not verify over the reconstructed L1/L2 transcript")
+}

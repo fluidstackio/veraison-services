@@ -18,17 +18,18 @@ import (
 const ProfileString = "tag:fluidstack.io,2026:spdm-redfish"
 
 // A trust anchor is the vendor root an SPDM responder's certificate chain ends
-// at, keyed by that root's subject: class vendor is its O, class model its CN.
-// GetTrustAnchorIDs derives the same key from the evidence.
+// at, keyed by that root's subject: class model is its CN, class vendor its O
+// when it has one. GetTrustAnchorIDs derives the same key from the evidence
+// (rootClass), so the two must agree on when vendor is present.
 func validateTrustAnchorEnvironment(env *comid.Environment) error {
 	if env.Class == nil {
 		return errors.New("missing class")
 	}
-	if env.Class.Vendor == nil {
-		return errors.New("missing vendor (the root certificate's O)")
-	}
 	if env.Class.Model == nil {
 		return errors.New("missing model (the root certificate's CN)")
+	}
+	if env.Class.ClassID != nil {
+		return errors.New("class ID must not be set: trust anchors are keyed by the root's subject")
 	}
 	if env.Instance != nil {
 		return errors.New("instance must not be set: a trust anchor here is a vendor root, not a device")

@@ -6,9 +6,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/subtle"
 	"crypto/x509"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
 	"time"
 )
 
@@ -271,6 +273,7 @@ func verifyChain(chain [][]byte, anchors *x509.CertPool, now time.Time) (*x509.C
 		if err != nil {
 			return nil, fmt.Errorf("parsing certificate %d: %w", i, err)
 		}
+		acceptDICEExtensions(cert)
 		certs = append(certs, cert)
 	}
 	leaf := selectLeaf(certs)
@@ -294,6 +297,33 @@ func verifyChain(chain [][]byte, anchors *x509.CertPool, now time.Time) (*x509.C
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	})
 	return leaf, err
+}
+
+// diceExtensions are the TCG DICE certificate extensions this verifier accounts
+// for (TCG DICE Attestation Architecture, tcg-dice arc 2.23.133.5.4). The spec
+// marks TcbInfo critical so that a verifier which does not understand DICE
+// refuses the chain rather than ignoring what it records; Go's x509 does
+// exactly that, which is how the Intel CPU responders failed with "unhandled
+// critical extension".
+//
+// Accepting them is a claim about this code, so it is deliberately narrow:
+// what they record is layered firmware identity, the same kind of fact as the
+// SPDM measurement blocks, and like those it is surfaced but not yet compared
+// against reference values. Any other unknown critical extension still fails.
+var diceExtensions = []asn1.ObjectIdentifier{
+	{2, 23, 133, 5, 4, 1}, // tcg-dice-TcbInfo
+	{2, 23, 133, 5, 4, 4}, // tcg-dice-Ueid
+	{2, 23, 133, 5, 4, 5}, // tcg-dice-MultiTcbInfo
+}
+
+func acceptDICEExtensions(cert *x509.Certificate) {
+	kept := cert.UnhandledCriticalExtensions[:0]
+	for _, oid := range cert.UnhandledCriticalExtensions {
+		if !slices.ContainsFunc(diceExtensions, oid.Equal) {
+			kept = append(kept, oid)
+		}
+	}
+	cert.UnhandledCriticalExtensions = kept
 }
 
 // selectLeaf picks the end-entity certificate out of a responder chain without
