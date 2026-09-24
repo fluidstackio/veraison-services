@@ -346,8 +346,10 @@ func TestSignatureByteOrder_BigEndianStillAcceptedForSPDM10(t *testing.T) {
 // covers every GET_MEASUREMENTS exchange in the responder's context since its
 // last signed one, so an exchange by another requester in between would be
 // signed over and absent from the payload; it was collected a minute after
-// another session's fsattest activity. Unconfirmed. Either way it must be
-// rejected: a concurrent requester can deny SPDM 1.0 evidence, never forge it.
+// another session's fsattest activity. Three fresh collections from the same
+// socket on 2026-09-24, with nothing else collecting, all verified -- a one-off,
+// consistent with interleaving. Either way it must be rejected: a concurrent
+// requester can deny SPDM 1.0 evidence, never forge it.
 func TestIntelCPU_UnverifiableTranscriptIsRejected(t *testing.T) {
 	b := loadBundle(t, "mach2-cpu-socket0-unverifiable.json")
 	requireBadEvidence(t, NewImplementation().ValidateEvidenceIntegrity(
