@@ -4,6 +4,7 @@ package spdm
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
@@ -178,6 +179,18 @@ func authorizer(keys *comid.CryptoKeys) string {
 		}
 		if c, err := x509.ParseCertificate(der); err == nil && c.Subject.CommonName != "" {
 			return c.Subject.CommonName
+		}
+	}
+	if k.Type() == comid.PKIXBase64KeyType {
+		der := []byte(k.String())
+		if blk, _ := pem.Decode(der); blk != nil {
+			der = blk.Bytes
+		}
+		if _, err := x509.ParsePKIXPublicKey(der); err == nil {
+			// A key has no name; its SPKI thumbprint identifies it. Tooling
+			// that knows the vendor (Dell's PGP release key, say) can map it.
+			sum := sha256.Sum256(der)
+			return "key sha256:" + hex.EncodeToString(sum[:8])
 		}
 	}
 	return "authorized key (" + k.Type() + ")"
