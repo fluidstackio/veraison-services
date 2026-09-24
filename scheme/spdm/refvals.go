@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"regexp"
@@ -87,6 +88,10 @@ type refValue struct {
 	digests [][]byte // any one may match
 	raw     []byte
 	mask    []byte
+	// vendor names who authorized the value: the CN of the measurement's
+	// authorized-by certificate. Empty means our own baseline -- a value
+	// captured from the fleet, which catches change but vouches for nothing.
+	vendor string
 }
 
 func (r refValue) matches(observed []byte) bool {
@@ -148,6 +153,7 @@ func referenceValues(endorsements []*comid.ValueTriple) (map[uint64]refValue, er
 			default:
 				return nil, fmt.Errorf("reference value for index %d has neither digests nor a raw value", idx)
 			}
+			rv.vendor = authorizer(m.AuthorizedBy)
 			if prev, ok := refs[idx]; ok && prev.String() != rv.String() {
 				return nil, fmt.Errorf("conflicting reference values for index %d", idx)
 			}
@@ -155,6 +161,26 @@ func referenceValues(endorsements []*comid.ValueTriple) (map[uint64]refValue, er
 		}
 	}
 	return refs, nil
+}
+
+// authorizer is the CN of the first certificate in a measurement's
+// authorized-by, or "" when there is none. A key that is not a certificate still
+// counts as authorized, under a placeholder, rather than silently as baseline.
+func authorizer(keys *comid.CryptoKeys) string {
+	if keys == nil || len(*keys) == 0 {
+		return ""
+	}
+	k := (*keys)[0]
+	if k.Type() == comid.PKIXBase64CertType {
+		der := []byte(k.String())
+		if blk, _ := pem.Decode(der); blk != nil {
+			der = blk.Bytes
+		}
+		if c, err := x509.ParseCertificate(der); err == nil && c.Subject.CommonName != "" {
+			return c.Subject.CommonName
+		}
+	}
+	return "authorized key (" + k.Type() + ")"
 }
 
 type observedBlock struct {
@@ -217,10 +243,17 @@ type comparison struct {
 	matched    int
 	mismatches []mismatch
 	unscored   int
+	// matches by provenance, per claim: vendor-authorized or our baseline
+	vendorBacked map[scoredClaim]int
+	baseline     map[scoredClaim]int
+	vendors      map[string]bool
 }
 
 func compare(refs map[uint64]refValue, observed map[uint64]observedBlock) comparison {
-	c := comparison{scored: map[scoredClaim]bool{}, failed: map[scoredClaim]bool{}}
+	c := comparison{
+		scored: map[scoredClaim]bool{}, failed: map[scoredClaim]bool{},
+		vendorBacked: map[scoredClaim]int{}, baseline: map[scoredClaim]int{}, vendors: map[string]bool{},
+	}
 	indices := make([]uint64, 0, len(refs))
 	for i := range refs {
 		indices = append(indices, i)
@@ -243,6 +276,12 @@ func compare(refs map[uint64]refValue, observed map[uint64]observedBlock) compar
 			c.mismatches = append(c.mismatches, mismatch{idx, claim.String(), ref.String(), "absent"})
 		case ref.matches(blk.value):
 			c.matched++
+			if ref.vendor != "" {
+				c.vendorBacked[claim]++
+				c.vendors[ref.vendor] = true
+			} else {
+				c.baseline[claim]++
+			}
 		default:
 			c.failed[claim] = true
 			c.mismatches = append(c.mismatches, mismatch{idx, claim.String(), ref.String(), hex.EncodeToString(blk.value)})
@@ -283,11 +322,27 @@ func (c comparison) policyClaims() map[string]any {
 			"index": m.Index, "claim": m.Claim, "expected": m.Expected, "observed": m.Observed,
 		})
 	}
+	vendors := make([]string, 0, len(c.vendors))
+	for v := range c.vendors {
+		vendors = append(vendors, v)
+	}
+	sort.Strings(vendors)
+	prov := func(cl scoredClaim) map[string]any {
+		return map[string]any{"vendor-backed": c.vendorBacked[cl], "baseline": c.baseline[cl]}
+	}
 	return map[string]any{
 		"reference-values": map[string]any{
 			"matched":    c.matched,
 			"mismatched": mm,
 			"unscored":   c.unscored,
+			// Where each match's expected value came from. Baseline matches
+			// are scored as known good by policy, but they only prove nothing
+			// changed; vendor-backed ones prove the vendor published the value.
+			"provenance": map[string]any{
+				"executables":   prov(claimExecutables),
+				"configuration": prov(claimConfiguration),
+				"vendors":       vendors,
+			},
 		},
 	}
 }

@@ -3,9 +3,17 @@
 package spdm
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -182,4 +190,48 @@ func TestProfile_ReferenceValueShapeIsEnforced(t *testing.T) {
 	require.NoError(t, err)
 	both.AddDigest(int(swid.Sha384), make([]byte, 48)).SetRawValueBytes([]byte{1}, nil)
 	assert.ErrorContains(t, validateMeasurements([]comid.Measurement{*both}), "exactly one")
+}
+
+func vendorCertPEM(t *testing.T, cn string) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(7), Subject: pkix.Name{CommonName: cn},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+func TestAppraise_ProvenanceSeparatesVendorFromBaseline(t *testing.T) {
+	claims := gpuClaims(t)
+	// 4 and 5 are firmware; 7 is firmware configuration. Mark 4 as vendor-
+	// authorized, the way values taken from a verified NVIDIA RIM are.
+	golden := goldenFrom(t, claims, 4, 5, 7)
+	k, err := comid.NewPKIXBase64Cert(vendorCertPEM(t, "RIM L4 Signer"))
+	require.NoError(t, err)
+	golden.Measurements.Values[0].AuthorizedBy = &comid.CryptoKeys{k}
+
+	result, err := NewImplementation().AppraiseClaims(claims, []*comid.ValueTriple{golden})
+	require.NoError(t, err)
+	a := result.Submods[Descriptor.Name]
+	// Baseline matches are still known good, by policy.
+	assert.Equal(t, ear.ApprovedRuntimeClaim, a.TrustVector.Executables)
+	assert.Equal(t, ear.ApprovedConfigClaim, a.TrustVector.Configuration)
+
+	rv := (*a.VeraisonPolicyClaims)["reference-values"].(map[string]any)
+	prov := rv["provenance"].(map[string]any)
+	assert.Equal(t, map[string]any{"vendor-backed": 1, "baseline": 1}, prov["executables"])
+	assert.Equal(t, map[string]any{"vendor-backed": 0, "baseline": 1}, prov["configuration"])
+	assert.Equal(t, []string{"RIM L4 Signer"}, prov["vendors"])
+}
+
+func TestAppraise_NoAuthorizedByIsAllBaseline(t *testing.T) {
+	claims := gpuClaims(t)
+	result, err := NewImplementation().AppraiseClaims(claims, []*comid.ValueTriple{goldenFrom(t, claims, 4, 5, 7)})
+	require.NoError(t, err)
+	rv := (*result.Submods[Descriptor.Name].VeraisonPolicyClaims)["reference-values"].(map[string]any)
+	prov := rv["provenance"].(map[string]any)
+	assert.Equal(t, map[string]any{"vendor-backed": 0, "baseline": 2}, prov["executables"])
+	assert.Empty(t, prov["vendors"])
 }
