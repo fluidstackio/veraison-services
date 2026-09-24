@@ -47,6 +47,41 @@ func validateCryptoKeys(keys []*comid.CryptoKey) error {
 	return nil
 }
 
+// Reference values are keyed by chip and component class (see refvals.go):
+// class vendor is the CN issuing the responder's leaf, class model the class.
+func validateReferenceValueEnvironment(env *comid.Environment) error {
+	if env.Class == nil || env.Class.Vendor == nil || env.Class.Model == nil {
+		return errors.New("class needs vendor (the chip) and model (the component class)")
+	}
+	if env.Class.ClassID != nil || env.Instance != nil || env.Group != nil {
+		return errors.New("only class vendor and model are used; class ID, instance and group must not be set")
+	}
+	return nil
+}
+
+// Each reference value is one SPDM measurement block: keyed by its index,
+// carrying either the digests it may equal or the raw bitstream it must equal.
+func validateMeasurements(measurements []comid.Measurement) error {
+	for i, m := range measurements {
+		if m.Key == nil || m.Key.Type() != comid.UintType {
+			return fmt.Errorf("measurement %d: key must be the SPDM measurement index, as uint", i)
+		}
+		idx, err := m.Key.GetKeyUint()
+		if err != nil {
+			return fmt.Errorf("measurement %d: %w", i, err)
+		}
+		if idx < 1 || idx > 0xFE {
+			return fmt.Errorf("measurement %d: SPDM index %d out of range 1..254", i, idx)
+		}
+		hasDigests := m.Val.Digests != nil && len(*m.Val.Digests) > 0
+		hasRaw := m.Val.RawValue != nil
+		if hasDigests == hasRaw {
+			return fmt.Errorf("measurement %d (index %d): needs exactly one of digests or raw-value", i, idx)
+		}
+	}
+	return nil
+}
+
 func init() {
 	profileID, err := corim.NewProfileFromString(ProfileString)
 	if err != nil {
@@ -54,12 +89,10 @@ func init() {
 	}
 
 	validator := &common.TriplesValidator{
-		TAEnviromentValidator: validateTrustAnchorEnvironment,
-		CryptoKeysValidator:   validateCryptoKeys,
-		// Reference values are not appraised yet; see AppraiseClaims. Refusing
-		// them keeps a provisioned CoRIM from implying a comparison that does
-		// not happen.
-		DisallowRefVals: true,
+		TAEnviromentValidator:     validateTrustAnchorEnvironment,
+		RefValEnviromentValidator: validateReferenceValueEnvironment,
+		CryptoKeysValidator:       validateCryptoKeys,
+		MeasurementsValidator:     validateMeasurements,
 	}
 	extMap := extensions.NewMap().Add(comid.ExtTriples, validator)
 

@@ -133,8 +133,15 @@ func (o *Implementation) ExtractClaims(
 		blocks = append(blocks, entry)
 	}
 
+	chip, err := chipIdentity(b.CertChain)
+	if err != nil {
+		return nil, handler.BadEvidence(err)
+	}
+
 	claims := map[string]any{
 		"target-id":           b.TargetID,
+		"component-class":     componentClass(b.TargetID),
+		"chip":                chip,
 		"spdm-version":        m.Version.String(),
 		"signature-algorithm": alg.Name,
 		"request-in-payload":  payload.RequestPrepended,
@@ -147,6 +154,24 @@ func (o *Implementation) ExtractClaims(
 		claims["node-id"] = b.NodeID
 	}
 	return claims, nil
+}
+
+// GetReferenceValueIDs keys the golden measurements on the chip, from the
+// signed chain, and the component class; see refvals.go. With none
+// provisioned for that key, vts supplies no endorsements and the measurements
+// are left unscored.
+func (o *Implementation) GetReferenceValueIDs(
+	trustAnchors []*comid.KeyTriple,
+	claims map[string]any,
+) ([]*comid.Environment, error) {
+	chip, ok1 := claims["chip"].(string)
+	class, ok2 := claims["component-class"].(string)
+	if !ok1 || !ok2 || chip == "" || class == "" {
+		return nil, handler.BadEvidence("claims carry no chip and component class to key reference values on")
+	}
+	return []*comid.Environment{{
+		Class: &comid.Class{Vendor: &chip, Model: &class},
+	}}, nil
 }
 
 // ValidateEvidenceIntegrity is the whole trust decision: signature, chain and
@@ -225,8 +250,9 @@ func (o *Implementation) ValidateEvidenceIntegrity(
 }
 
 // AppraiseClaims runs only after integrity validation has passed, so the device
-// is genuine and the result fresh. Measurements are not compared against
-// anything yet, so no claim is made about them.
+// is genuine and the result fresh. Measurements are compared against whatever
+// reference values are provisioned for its chip and class; with none, the
+// executables and configuration claims are left unset rather than approved.
 func (o *Implementation) AppraiseClaims(
 	claims map[string]any,
 	endorsements []*comid.ValueTriple,
@@ -235,6 +261,25 @@ func (o *Implementation) AppraiseClaims(
 	a := result.Submods[Descriptor.Name]
 
 	a.TrustVector.Hardware = ear.GenuineHardwareClaim
+
+	if len(endorsements) > 0 {
+		refs, err := referenceValues(endorsements)
+		if err != nil {
+			return result, err
+		}
+		observed, err := observedBlocks(claims)
+		if err != nil {
+			return result, handler.BadEvidence(err)
+		}
+		cmp := compare(refs, observed)
+		cmp.apply(a.TrustVector)
+		pc := cmp.policyClaims()
+		a.VeraisonPolicyClaims = &pc
+		o.logger.Debugw("reference values compared",
+			"target", claims["target-id"], "matched", cmp.matched,
+			"mismatched", len(cmp.mismatches), "unscored", cmp.unscored)
+	}
+
 	a.UpdateStatusFromTrustVector()
 	a.VeraisonAnnotatedEvidence = &claims
 
