@@ -58,6 +58,19 @@ type GRPCConfig struct {
 	ServerCert    string   `mapstructure:"cert" config:"zerodefault"`
 	ServerCertKey string   `mapstructure:"cert-key" config:"zerodefault"`
 	CACerts       []string `mapstructure:"ca-certs" config:"zerodefault"`
+
+	// RequireSignedCorim refuses unsigned CoRIM submissions
+	// (application/rim+cbor), accepting only application/rim+cose whose
+	// signing certificate chains to one of CACerts.
+	//
+	// Endorsements decide what the verifier considers trustworthy, so a
+	// poisoned endorsement yields a legitimately signed EAR. Requiring a
+	// signature makes that write path cryptographically gated rather than
+	// gated only by whatever authenticates the API caller.
+	//
+	// Defaults to false to preserve existing behaviour; deployments that
+	// provision only signed CoRIMs should set it.
+	RequireSignedCorim bool `mapstructure:"require-signed-corim" config:"zerodefault"`
 }
 
 func NewGRPCConfig() *GRPCConfig {
@@ -72,8 +85,9 @@ type GRPC struct {
 	CoservProxyPluginManager plugin.IManager[handlermod.ICoservProxyHandler]
 	PolicyManager            *policymanager.PolicyManager
 	EarSigner                earsigner.IEarSigner
-	CoservContext             *vtscoserv.Context
+	CoservContext            *vtscoserv.Context
 	rootCerts                *x509.CertPool
+	requireSignedCorim       bool
 
 	Server *grpc.Server
 	Socket net.Listener
@@ -98,7 +112,7 @@ func NewGRPC(
 		CoservProxyPluginManager: coservProxyPluginManager,
 		PolicyManager:            policyManager,
 		EarSigner:                earSigner,
-		CoservContext:             coservConfig,
+		CoservContext:            coservConfig,
 		logger:                   logger,
 	}
 }
@@ -140,6 +154,11 @@ func (o *GRPC) Init(
 	}
 
 	var opts []grpc.ServerOption
+
+	o.requireSignedCorim = cfg.RequireSignedCorim
+	if o.requireSignedCorim {
+		o.logger.Info("unsigned CoRIMs will be refused; only application/rim+cose is accepted")
+	}
 
 	o.logger.Info("loading root CA certs")
 	o.rootCerts, err = LoadCACerts(cfg.CACerts)
@@ -233,6 +252,13 @@ func (o *GRPC) SubmitEndorsements(
 			return submitEndorsementErrorResponse(err), nil
 		}
 	case "application/rim+cbor":
+		if o.requireSignedCorim {
+			err = fmt.Errorf(
+				"unsigned CoRIMs are not accepted: submit %s signed by a certificate chaining to a configured CA",
+				"application/rim+cose",
+			)
+			return submitEndorsementErrorResponse(err), nil
+		}
 		uc, err = o.decodeAndValidateUnsignedCorim(req.Data)
 		if err != nil {
 			return submitEndorsementErrorResponse(err), nil
@@ -510,7 +536,31 @@ func (c *GRPC) GetSupportedVerificationMediaTypes(context.Context, *emptypb.Empt
 
 func (c *GRPC) GetSupportedProvisioningMediaTypes(context.Context, *emptypb.Empty) (*proto.MediaTypeList, error) {
 	mts := c.SchemePluginManager.GetRegisteredMediaTypesByCategory("provisioning")
-	return &proto.MediaTypeList{MediaTypes: mts}, nil
+
+	// Advertise only what will actually be accepted. Without this the service
+	// would list application/rim+cbor and then refuse it, so a client would
+	// discover the policy from a failed submission instead of the
+	// media-type negotiation that exists to tell it.
+	return &proto.MediaTypeList{MediaTypes: c.filterProvisioningMediaTypes(mts)}, nil
+}
+
+// filterProvisioningMediaTypes drops the unsigned CoRIM form when signed CoRIMs
+// are required, so the advertised set matches what SubmitEndorsements accepts.
+func (c *GRPC) filterProvisioningMediaTypes(mts []string) []string {
+	if !c.requireSignedCorim {
+		return mts
+	}
+
+	filtered := make([]string, 0, len(mts))
+	for _, mt := range mts {
+		t, _, err := mime.ParseMediaType(mt)
+		if err != nil || t == "application/rim+cbor" {
+			continue
+		}
+		filtered = append(filtered, mt)
+	}
+
+	return filtered
 }
 
 func (c *GRPC) assembleCoservMediaTypes(mts []string, filter string) []string {
